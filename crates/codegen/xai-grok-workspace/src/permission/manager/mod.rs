@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -67,6 +67,7 @@ impl Drop for InFlightGuard {
 pub enum PermissionHandle {
     Actor {
         cmd_tx: mpsc::UnboundedSender<PermissionCommand>,
+        review_generation: Arc<AtomicU64>,
         yolo_state: Arc<AtomicBool>,
         /// Auto mode (LLM classifier), mutually exclusive with yolo at runtime.
         auto_state: Arc<AtomicBool>,
@@ -88,11 +89,28 @@ pub enum PermissionHandle {
 }
 
 impl PermissionHandle {
+    fn invalidate_reviews(&self) {
+        if let Self::Actor {
+            review_generation, ..
+        } = self
+        {
+            review_generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn revoke_pending_reviews(&self) {
+        self.invalidate_reviews();
+        if let Self::Actor { cmd_tx, .. } = self {
+            let _ = cmd_tx.send(PermissionCommand::InvalidateReviews);
+        }
+    }
+
     pub fn allow_all() -> Self {
         PermissionHandle::AllowAll
     }
 
     pub fn set_yolo_mode(&self, enabled: bool) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor {
             cmd_tx,
             yolo_state,
@@ -117,6 +135,7 @@ impl PermissionHandle {
     /// Enable or disable auto mode (LLM classifier).
     /// Enabling auto clears yolo and installs the default conversation-aware classifier when none is set.
     pub fn set_auto_mode(&self, enabled: bool) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor {
             cmd_tx,
             yolo_state,
@@ -141,6 +160,7 @@ impl PermissionHandle {
         &self,
         classifier: Option<crate::permission::auto_mode::SharedClassifier>,
     ) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor {
             cmd_tx,
             side_query_wired,
@@ -161,6 +181,7 @@ impl PermissionHandle {
         classifier: crate::permission::auto_mode::SharedClassifier,
         has_side_query: bool,
     ) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor {
             cmd_tx,
             side_query_wired,
@@ -189,6 +210,7 @@ impl PermissionHandle {
         &self,
         turns: Vec<crate::permission::auto_mode::ClassifierTurn>,
     ) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor { cmd_tx, .. } = self
             && let Err(e) = cmd_tx.send(PermissionCommand::SetClassifierTranscript(turns))
         {
@@ -198,6 +220,7 @@ impl PermissionHandle {
 
     /// Update the project AGENTS.md instructions used by the auto-mode classifier.
     pub fn set_project_instructions(&self, instructions: Option<String>) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor { cmd_tx, .. } = self
             && let Err(e) = cmd_tx.send(PermissionCommand::SetProjectInstructions(instructions))
         {
@@ -207,6 +230,7 @@ impl PermissionHandle {
 
     /// Reset per-tool permission state back to defaults.
     pub fn reset_state(&self) {
+        self.invalidate_reviews();
         if let PermissionHandle::Actor { cmd_tx, .. } = self
             && let Err(e) = cmd_tx.send(PermissionCommand::ResetState)
         {
@@ -276,6 +300,7 @@ impl PermissionHandle {
                     );
                 }
                 PermissionResolution {
+                    review_guard: None,
                     decision: Decision::Allow,
                     event: None,
                 }
@@ -292,6 +317,7 @@ impl PermissionHandle {
                 if let Err(e) = cmd_tx.send(msg) {
                     tracing::error!(?e, "failed to send permission request");
                     return PermissionResolution {
+                        review_guard: None,
                         decision: Decision::Reject("permission manager unavailable".to_owned()),
                         event: None,
                     };
@@ -302,6 +328,7 @@ impl PermissionHandle {
                     Err(e) => {
                         tracing::error!(?e, "failed to receive permission decision");
                         PermissionResolution {
+                            review_guard: None,
                             decision: Decision::Reject(
                                 "failed to receive permission decision".to_owned(),
                             ),
@@ -323,7 +350,7 @@ const MAX_RECORDED_PERMISSION_DECISIONS: usize = 12;
 
 fn prompted_decision_approved(decision: &Decision, outcome_str: &str) -> Option<bool> {
     match decision {
-        Decision::Allow => Some(true),
+        Decision::Allow if outcome_str != "reviewed_allow_once" => Some(true),
         Decision::Reject(_) if outcome_str != "error" => Some(false),
         _ => None,
     }
@@ -473,6 +500,8 @@ pub fn spawn_permission_manager_with_pin(
     let auto_state = Arc::new(AtomicBool::new(seed_auto));
     let auto_state_actor = auto_state.clone();
     let side_query_wired = Arc::new(AtomicBool::new(false));
+    let review_generation = Arc::new(AtomicU64::new(0));
+    let review_generation_actor = review_generation.clone();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let in_flight_actor = in_flight.clone();
     let user_prompt_notify = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<()>>));
@@ -520,8 +549,22 @@ pub fn spawn_permission_manager_with_pin(
             .iter()
             .map(String::as_str)
             .eq(DEFAULT_ALLOWED_DOMAINS.iter().copied());
+        let mut applied_review_generation = 0_u64;
         while let Some(cmd) = rx.recv().await {
+            if matches!(
+                &cmd,
+                PermissionCommand::SetYoloMode(_)
+                    | PermissionCommand::SetAutoMode(_)
+                    | PermissionCommand::SetClassifier(_)
+                    | PermissionCommand::SetClassifierTranscript(_)
+                    | PermissionCommand::SetProjectInstructions(_)
+                    | PermissionCommand::ResetState
+                    | PermissionCommand::InvalidateReviews
+            ) {
+                applied_review_generation += 1;
+            }
             match cmd {
+                PermissionCommand::InvalidateReviews => {}
                 PermissionCommand::SetYoloMode(enabled) => {
                     let clamped = clamp_yolo(enabled, yolo_pin);
                     if enabled && !clamped && !pin_refusal_logged {
@@ -579,6 +622,12 @@ pub fn spawn_permission_manager_with_pin(
                         },
                     mut respond_to,
                 } => {
+                    let request_generation = applied_review_generation;
+                    let review_store_snapshot = if auto_mode {
+                        super::review::StoreSnapshot::capture(store.review_paths()).await
+                    } else {
+                        None
+                    };
                     let request_received = std::time::Instant::now();
                     let request_cwd = path_context
                         .as_ref()
@@ -627,7 +676,9 @@ pub fn spawn_permission_manager_with_pin(
                         let (decision_str, reject_reason) = match decision {
                             Decision::Allow => ("allow".to_string(), None),
                             Decision::Ask => ("ask".to_string(), None),
-                            Decision::Reject(reason) | Decision::PolicyDeny(reason) => {
+                            Decision::ReviewerRejected(reason)
+                            | Decision::Reject(reason)
+                            | Decision::PolicyDeny(reason) => {
                                 ("reject".to_string(), Some(reason.clone()))
                             }
                             Decision::FollowupMessage(_) => ("followup".to_string(), None),
@@ -690,6 +741,8 @@ pub fn spawn_permission_manager_with_pin(
                         AccessKind::Bash(_) | AccessKind::MCPTool { .. } | AccessKind::WebFetch(_)
                     ) && let Some(fresh) = store.reload_if_changed().await
                     {
+                        review_generation_actor.fetch_add(1, Ordering::SeqCst);
+                        applied_review_generation += 1;
                         // Disk must not raise allow_bash_execute; prefix/glob/MCP grants still reload.
                         let allow_bash_execute = state.allow_bash_execute;
                         state.merge_grants_from(fresh);
@@ -769,6 +822,7 @@ pub fn spawn_permission_manager_with_pin(
                         let event =
                             emit_event(&decision, false, false, None, Some(reasons::POLICY_DENY));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -780,6 +834,7 @@ pub fn spawn_permission_manager_with_pin(
                         let decision = Decision::Allow;
                         let event = emit_event(&decision, true, false, None, Some(reasons::YOLO));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -806,6 +861,7 @@ pub fn spawn_permission_manager_with_pin(
                         );
                         let event = emit_event(&decision, true, false, None, Some(reason));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -835,6 +891,7 @@ pub fn spawn_permission_manager_with_pin(
                         let event =
                             emit_event(&decision, true, false, None, Some(reasons::POLICY_ALLOW));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -865,6 +922,7 @@ pub fn spawn_permission_manager_with_pin(
                                     Some(reasons::AUTO_FAST_PATH),
                                 );
                                 let _ = respond_to.send(PermissionResolution {
+                                    review_guard: None,
                                     decision,
                                     event: Some(event),
                                 });
@@ -991,6 +1049,7 @@ pub fn spawn_permission_manager_with_pin(
                                                 Some(reasons::AUTO_CLASSIFIER_ALLOW),
                                             );
                                             let _ = respond_to.send(PermissionResolution {
+                                                review_guard: None,
                                                 decision,
                                                 event: Some(event),
                                             });
@@ -1045,6 +1104,7 @@ pub fn spawn_permission_manager_with_pin(
                                             Some(reasons::AUTO_CLASSIFIER_DENY),
                                         );
                                         let _ = respond_to.send(PermissionResolution {
+                                            review_guard: None,
                                             decision,
                                             event: Some(event),
                                         });
@@ -1098,6 +1158,7 @@ pub fn spawn_permission_manager_with_pin(
                         let event =
                             emit_event(&decision, true, false, None, Some(reasons::SANDBOX_AUTO));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -1149,6 +1210,7 @@ pub fn spawn_permission_manager_with_pin(
                                 Some(reasons::POLICY_ALLOW),
                             );
                             let _ = respond_to.send(PermissionResolution {
+                                review_guard: None,
                                 decision,
                                 event: Some(event),
                             });
@@ -1296,6 +1358,7 @@ pub fn spawn_permission_manager_with_pin(
                     if let Some((decision, reason)) = pre_decision {
                         let event = emit_event(&decision, true, false, None, Some(reason));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -1308,6 +1371,7 @@ pub fn spawn_permission_manager_with_pin(
                         let event =
                             emit_event(&decision, false, false, None, Some(reasons::PROMPT_DENY));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -1326,6 +1390,7 @@ pub fn spawn_permission_manager_with_pin(
                         let event =
                             emit_event(&decision, true, false, None, Some(reasons::PROMPT_ALLOW));
                         let _ = respond_to.send(PermissionResolution {
+                            review_guard: None,
                             decision,
                             event: Some(event),
                         });
@@ -1365,9 +1430,134 @@ pub fn spawn_permission_manager_with_pin(
                             let _ = tx.send(());
                         }
                     }
+                    let findings = bash_evaluation
+                        .as_ref()
+                        .map(|e| e.assessment.tokens())
+                        .unwrap_or_default();
+                    let native_review_decision = preflight.classifier_allowed_decision();
+                    let eligible = super::review::review_eligible(
+                        &native_review_decision,
+                        auto_mode,
+                        matches!(
+                            auto_prompt_reason,
+                            Some(reasons::AUTO_CLASSIFIER_DENY | reasons::AUTO_DENIAL_LIMIT)
+                        ),
+                        policy_forced_prompt
+                            || shell_forced_prompt
+                            || hook_forced_prompt
+                            || protected_edit.is_some()
+                            || opaque_floor,
+                        &findings,
+                    );
+                    let eligibility = if eligible {
+                        super::review::Eligibility::ClassifierHold {
+                            reason: prompt_trigger.into(),
+                        }
+                    } else {
+                        let mut restrictions = Vec::new();
+                        if !auto_mode {
+                            restrictions.push("not_auto");
+                        }
+                        if policy_forced_prompt {
+                            restrictions.push("policy_forced_prompt");
+                        }
+                        if shell_forced_prompt {
+                            restrictions.push("shell_forced_prompt");
+                        }
+                        if hook_forced_prompt {
+                            restrictions.push("hook_ask");
+                        }
+                        if protected_edit.is_some() {
+                            restrictions.push("protected_edit");
+                        }
+                        if opaque_floor {
+                            restrictions.push("opaque_shell");
+                        }
+                        if !matches!(native_review_decision, Decision::Allow) {
+                            restrictions.push("native_matcher_requires_prompt_or_denies");
+                        }
+                        if findings.iter().any(|f| {
+                            matches!(
+                                f.as_str(),
+                                "env_injection" | "exec_or_ambient_git" | "special_exec_surface"
+                            )
+                        }) {
+                            restrictions.push("unsupported_execution_surface");
+                        }
+                        super::review::Eligibility::HumanRequired {
+                            reason: format!(
+                                "restrictions=[{}]; findings=[{}]; trigger={prompt_trigger}",
+                                restrictions.join(","),
+                                findings.join(",")
+                            ),
+                        }
+                    };
+                    let review = super::review::PendingReview::new(
+                        session_id.to_string(),
+                        &tool_call_update,
+                        &access,
+                        request_cwd,
+                        request_generation,
+                        eligibility,
+                        findings,
+                    );
                     let prompt_outcome = tokio::select! {
-                        outcome = prompter.request(&access, &tool_call_update, protected_edit, hook_ask.as_ref()) => outcome,
+                        outcome = prompter.request_with_review(&access, &tool_call_update, protected_edit, hook_ask.as_ref(), Some(&review)) => outcome,
                         _ = respond_to.closed() => PromptOutcome::Cancelled,
+                    };
+                    let prompt_outcome = if let PromptOutcome::ReviewedAllowOnce(bindings) =
+                        &prompt_outcome
+                    {
+                        let input_scope_supported = match &access {
+                            AccessKind::Bash(_) => !bindings.is_empty(),
+                            AccessKind::Edit(_)
+                            | AccessKind::MCPTool { .. }
+                            | AccessKind::Tool(_) => !bindings.is_empty(),
+                            _ => true,
+                        };
+                        let inputs_match = input_scope_supported
+                            && tokio::select! {
+                                valid = super::review::inputs_match(bindings.clone()) => valid,
+                                _ = respond_to.closed() => false,
+                            };
+                        let changed_store = store.reload_if_changed().await;
+                        let state_changed = changed_store.is_some();
+                        if let Some(fresh) = changed_store {
+                            review_generation_actor.fetch_add(1, Ordering::SeqCst);
+                            applied_review_generation += 1;
+                            let allow_bash_execute = state.allow_bash_execute;
+                            state.merge_grants_from(fresh);
+                            state.allow_bash_execute = allow_bash_execute;
+                        }
+                        let store_unchanged = match &review_store_snapshot {
+                            Some(snapshot) => snapshot.unchanged().await,
+                            None => false,
+                        };
+                        let current_policy = GatePreflight::evaluate(
+                            compiled_policy.as_ref(),
+                            &access,
+                            request_cwd,
+                            auto_mode,
+                        );
+                        if respond_to.is_closed() {
+                            PromptOutcome::Cancelled
+                        } else if request_generation
+                            != review_generation_actor.load(Ordering::SeqCst)
+                            || state_changed
+                            || !store_unchanged
+                            || !eligible
+                            || !inputs_match
+                            || !matches!(
+                                current_policy.classifier_allowed_decision(),
+                                Decision::Allow
+                            )
+                        {
+                            PromptOutcome::ReviewerRejected("Native permission state or bound inputs changed or are unsupported; the action was not executed.".into())
+                        } else {
+                            prompt_outcome
+                        }
+                    } else {
+                        prompt_outcome
                     };
                     // A subagent message or a plain tool has no grant store: every "always" answer holds for this call only.
                     let prompt_outcome = match (&access, prompt_outcome) {
@@ -1387,20 +1577,26 @@ pub fn spawn_permission_manager_with_pin(
                     };
                     let recorded = record_prompt_outcome(&mut state, &access, &prompt_outcome);
                     if recorded.is_some() {
+                        review_generation_actor.fetch_add(1, Ordering::SeqCst);
+                        applied_review_generation += 1;
                         persist_state(&cwd, &state, client_id_ref).await;
                     }
                     let edits_for_session = matches!(
                         (&access, &prompt_outcome),
                         (AccessKind::Edit(_), PromptOutcome::AllowEditsForSession)
                     );
+                    if edits_for_session && !allow_edits_for_session {
+                        review_generation_actor.fetch_add(1, Ordering::SeqCst);
+                        applied_review_generation += 1;
+                    }
                     allow_edits_for_session |= edits_for_session;
                     let rejected = || Decision::Reject("User rejected the execution".to_owned());
                     // A scope that recorded nothing is reported as the once-answer it amounted to.
                     let kind = prompt_outcome.kind();
                     let (decision, effective_kind) = match &prompt_outcome {
-                        PromptOutcome::AllowOnce | PromptOutcome::AllowAlways => {
-                            (Decision::Allow, kind)
-                        }
+                        PromptOutcome::AllowOnce
+                        | PromptOutcome::ReviewedAllowOnce(_)
+                        | PromptOutcome::AllowAlways => (Decision::Allow, kind),
                         PromptOutcome::AllowEditsForSession => (
                             Decision::Allow,
                             if edits_for_session {
@@ -1421,6 +1617,9 @@ pub fn spawn_permission_manager_with_pin(
                                 PromptOutcomeKind::AllowOnce
                             },
                         ),
+                        PromptOutcome::ReviewerRejected(message) => {
+                            (Decision::ReviewerRejected(message.clone()), kind)
+                        }
                         PromptOutcome::RejectOnce => (rejected(), kind),
                         PromptOutcome::RejectAlwaysBashCommand(_)
                         | PromptOutcome::RejectAlwaysMcpTool(_)
@@ -1482,6 +1681,21 @@ pub fn spawn_permission_manager_with_pin(
                         auto_total_denials = 0;
                     }
                     let _ = respond_to.send(PermissionResolution {
+                        review_guard: match &prompt_outcome {
+                            PromptOutcome::ReviewedAllowOnce(bindings)
+                                if matches!(decision, Decision::Allow) =>
+                            {
+                                Some(super::review::ExecutionGuard::new(
+                                    review_store_snapshot
+                                        .clone()
+                                        .expect("reviewed allow validated store snapshot"),
+                                    bindings.clone(),
+                                    request_generation,
+                                    review_generation_actor.clone(),
+                                ))
+                            }
+                            _ => None,
+                        },
                         decision,
                         event: Some(event),
                     });
@@ -1495,6 +1709,7 @@ pub fn spawn_permission_manager_with_pin(
     (
         PermissionHandle::Actor {
             cmd_tx: tx,
+            review_generation,
             yolo_state,
             auto_state,
             side_query_wired,
@@ -2610,6 +2825,7 @@ mod tests {
     fn handle_with_cmd_tx(cmd_tx: mpsc::UnboundedSender<PermissionCommand>) -> PermissionHandle {
         PermissionHandle::Actor {
             cmd_tx,
+            review_generation: Arc::new(AtomicU64::new(0)),
             yolo_state: Arc::new(AtomicBool::new(false)),
             auto_state: Arc::new(AtomicBool::new(false)),
             side_query_wired: Arc::new(AtomicBool::new(false)),

@@ -998,6 +998,7 @@ async fn post_tool_use_dispatch_merges_file_then_client_contributions() {
             };
             let drained = DrainedToolSuccess::new(run);
             let prepared = PreparedToolCall {
+                review_guard: None,
                 call_id: "call_1".to_string(),
                 tool_call_id: acp::ToolCallId::new("call_1"),
                 tool_name: "search__memory".to_string(),

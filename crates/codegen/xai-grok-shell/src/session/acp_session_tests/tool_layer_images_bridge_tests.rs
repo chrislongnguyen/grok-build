@@ -178,6 +178,7 @@ async fn handle_bridge_tool_success_replacement_drops_images_and_keeps_reminders
 }
 fn prepared_post_tool_use_call(id: &str, tool_name: &str) -> PreparedToolCall {
     PreparedToolCall {
+        review_guard: None,
         call_id: id.to_string(),
         tool_call_id: acp::ToolCallId::new(id),
         tool_name: tool_name.to_string(),

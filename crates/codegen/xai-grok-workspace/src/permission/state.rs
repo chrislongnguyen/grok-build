@@ -408,6 +408,23 @@ impl CachedStateStore {
         (store, state)
     }
 
+    pub(crate) fn review_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = vec![state_file_path(&self.dir, None)];
+        if matches!(self.access, StateFileAccess::Plain) {
+            paths.push(state_file_path(
+                &self.dir,
+                self.client_identifier.as_deref(),
+            ));
+            if let Some(legacy) = &self.legacy_dir {
+                paths.push(state_file_path(legacy, None));
+                paths.push(state_file_path(legacy, self.client_identifier.as_deref()));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     pub(crate) fn access(&self) -> &StateFileAccess {
         &self.access
     }

@@ -572,7 +572,9 @@ impl SessionActor {
                 .await
         };
         let message = match &resolution.decision {
-            Decision::PolicyDeny(reason) | Decision::Reject(reason) => {
+            Decision::ReviewerRejected(reason)
+            | Decision::PolicyDeny(reason)
+            | Decision::Reject(reason) => {
                 format!("MCP source Read denied: {reason}")
             }
             Decision::Allow
@@ -584,7 +586,9 @@ impl SessionActor {
         };
         let action = match resolution.decision {
             Decision::Allow => return Ok(None),
-            Decision::PolicyDeny(_) | Decision::Ask => ToolLoop::Continue,
+            Decision::ReviewerRejected(_) | Decision::PolicyDeny(_) | Decision::Ask => {
+                ToolLoop::Continue
+            }
             Decision::Reject(reason) => ToolLoop::PermissionReject {
                 tool_name: call.function.name.clone(),
                 reason,

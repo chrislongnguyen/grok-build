@@ -852,7 +852,11 @@ fn malformed_rule_entry_leaves_its_siblings_in_force_and_fails_closed() {
             Some(Decision::Allow) => RuleVerdict::Allow,
             Some(Decision::Ask) => RuleVerdict::Ask,
             Some(Decision::Reject(_) | Decision::PolicyDeny(_)) => RuleVerdict::Deny,
-            Some(decision @ (Decision::FollowupMessage(_) | Decision::Cancelled)) => {
+            Some(
+                decision @ (Decision::ReviewerRejected(_)
+                | Decision::FollowupMessage(_)
+                | Decision::Cancelled),
+            ) => {
                 panic!("a rule answered {decision:?} for `{command}`")
             }
         }

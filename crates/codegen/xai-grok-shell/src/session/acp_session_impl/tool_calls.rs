@@ -1755,6 +1755,7 @@ impl SessionActor {
                 wait_ms = 0_i64,
             );
         }
+        let mut review_guard = None;
         if !plan_file_auto_approve {
             let (perm_title, perm_kind, perm_raw_input) = tool_call_display
                 .as_ref()
@@ -1859,6 +1860,7 @@ impl SessionActor {
                 .span()
                 .record("wait_ms", perm_wait_start.elapsed().as_millis() as i64);
             perm_wait_span.close();
+            review_guard = resolution.review_guard;
             let manager_event = resolution.event;
             let decision = resolution.decision;
             self.events.permission_resolved(
@@ -1867,7 +1869,9 @@ impl SessionActor {
                     Decision::Allow | Decision::Ask => {
                         xai_grok_session_events::types::PermissionDecision::Allow
                     }
-                    Decision::Reject(_) | Decision::PolicyDeny(_) => {
+                    Decision::ReviewerRejected(_)
+                    | Decision::Reject(_)
+                    | Decision::PolicyDeny(_) => {
                         xai_grok_session_events::types::PermissionDecision::Deny
                     }
                     Decision::Cancelled => {
@@ -1920,8 +1924,13 @@ impl SessionActor {
                 }
             });
             match decision {
-                Decision::PolicyDeny(ref reason) | Decision::Reject(ref reason) => {
-                    let is_policy_deny = matches!(&decision, Decision::PolicyDeny(_));
+                Decision::ReviewerRejected(ref reason)
+                | Decision::PolicyDeny(ref reason)
+                | Decision::Reject(ref reason) => {
+                    let is_policy_deny = matches!(
+                        &decision,
+                        Decision::PolicyDeny(_) | Decision::ReviewerRejected(_)
+                    );
                     let message = if is_policy_deny {
                         format!("Tool `{}` was not executed: {reason}", call.function.name)
                     } else {
@@ -2139,6 +2148,7 @@ impl SessionActor {
         };
         let invocation_id = xai_grok_telemetry::events::InvocationId::generate();
         let prepared = PreparedToolCall {
+            review_guard,
             call_id: call.id.clone(),
             tool_call_id,
             tool_name: call.function.name.clone(),

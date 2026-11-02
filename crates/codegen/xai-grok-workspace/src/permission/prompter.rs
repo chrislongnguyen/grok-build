@@ -189,6 +189,8 @@ pub enum McpScopeSelection {
 #[derive(Debug)]
 pub enum PromptOutcome {
     AllowOnce,
+    ReviewedAllowOnce(Vec<super::review::InputBinding>),
+    ReviewerRejected(String),
     AllowAlways,
     /// Session-scoped: allow all edits for the remainder of this session only.
     /// Does **not** persist to disk (unlike the legacy `AllowAlways` path for edits).
@@ -223,6 +225,8 @@ crate::permission::wire_enum! {
     /// A new payload-bearing `PromptOutcome` variant fails to compile until it is mapped there and given a list entry here.
     pub enum PromptOutcomeKind {
         AllowOnce => "allow_once",
+        ReviewedAllowOnce => "reviewed_allow_once",
+        ReviewerRejected => "reviewer_rejected",
         AllowAlways => "allow_always",
         AllowEditsForSession => "allow_edits_for_session",
         AllowAlwaysBash => "allow_always_bash",
@@ -247,6 +251,8 @@ impl PromptOutcome {
     pub const fn kind(&self) -> PromptOutcomeKind {
         match self {
             Self::AllowOnce => PromptOutcomeKind::AllowOnce,
+            Self::ReviewedAllowOnce(_) => PromptOutcomeKind::ReviewedAllowOnce,
+            Self::ReviewerRejected(_) => PromptOutcomeKind::ReviewerRejected,
             Self::AllowAlways => PromptOutcomeKind::AllowAlways,
             Self::AllowEditsForSession => PromptOutcomeKind::AllowEditsForSession,
             Self::AllowAlwaysBashCommand(_) => PromptOutcomeKind::AllowAlwaysBash,
@@ -740,6 +746,18 @@ impl AcpPrompter {
         protected_edit: Option<crate::permission::ProtectedEditReason>,
         hook_ask: Option<&HookAsk>,
     ) -> PromptOutcome {
+        self.request_with_review(access, tool_call_update, protected_edit, hook_ask, None)
+            .await
+    }
+
+    pub async fn request_with_review(
+        &self,
+        access: &AccessKind,
+        tool_call_update: &acp::ToolCallUpdate,
+        protected_edit: Option<crate::permission::ProtectedEditReason>,
+        hook_ask: Option<&HookAsk>,
+        review: Option<&super::review::PendingReview>,
+    ) -> PromptOutcome {
         let tool_name = tool_name_for_access(access);
         // events.jsonl: `PermissionRequested` at prompt-start
         // The `Instant` captured here makes the paired `PermissionResolved.wait_ms` measure the user-facing prompt, not earlier manager bookkeeping
@@ -768,25 +786,46 @@ impl AcpPrompter {
             }
             None => {
                 let permission_options = self.build_options(access);
+                let mut metadata = self
+                    .permission_request_meta(access, protected_edit, hook_ask)
+                    .unwrap_or_default();
+                if let Some(review) = review {
+                    metadata.insert(
+                        super::review::META_KEY.into(),
+                        serde_json::to_value(review).expect("review is serializable"),
+                    );
+                }
                 let req = acp::RequestPermissionRequest::new(
                     self.session_id.clone(),
                     with_hook_ask_header(tool_call_update, hook_ask, &tool_name),
                     permission_options.values().cloned().collect(),
                 )
-                .meta(self.permission_request_meta(
-                    access,
-                    protected_edit,
-                    hook_ask,
-                ));
+                .meta(Some(metadata));
                 match self.gateway.request_permission(req).await {
                     Ok(resp) => match resp.outcome {
                         acp::RequestPermissionOutcome::Cancelled => PromptOutcome::Cancelled,
-                        acp::RequestPermissionOutcome::Selected(selected) => map_selected_outcome(
-                            &permission_options,
-                            &selected.option_id,
-                            resp.meta.as_ref(),
-                            access,
-                        ),
+                        acp::RequestPermissionOutcome::Selected(selected) => {
+                            if let Some(value) = resp
+                                .meta
+                                .as_ref()
+                                .and_then(|meta| meta.get(super::review::META_KEY))
+                            {
+                                match review {
+                                    Some(review) => review
+                                        .answer(value, permission_options.get(&selected.option_id)),
+                                    None => PromptOutcome::ReviewerRejected(
+                                        "No native review binding exists for this request.".into(),
+                                    ),
+                                }
+                            } else {
+                                map_selected_outcome(
+                                    &permission_options,
+                                    &selected.option_id,
+                                    resp.meta.as_ref(),
+                                    access,
+                                )
+                            }
+                        }
                         // TODO(acp-0.10): `RequestPermissionOutcome` is #[non_exhaustive].
                         _ => PromptOutcome::Error("unknown permission outcome".to_owned()),
                     },
@@ -883,6 +922,7 @@ pub fn tool_name_for_access(access: &AccessKind) -> String {
 fn permission_decision_for_outcome(outcome: &PromptOutcome) -> PermissionDecision {
     match outcome {
         PromptOutcome::AllowOnce
+        | PromptOutcome::ReviewedAllowOnce(_)
         | PromptOutcome::AllowAlways
         | PromptOutcome::AllowEditsForSession
         | PromptOutcome::AllowAlwaysBashCommand(_)
@@ -891,6 +931,7 @@ fn permission_decision_for_outcome(outcome: &PromptOutcome) -> PermissionDecisio
         | PromptOutcome::AllowAlwaysMcpTool(_)
         | PromptOutcome::AllowAlwaysMcpServer(_) => PermissionDecision::Allow,
         PromptOutcome::RejectOnce
+        | PromptOutcome::ReviewerRejected(_)
         | PromptOutcome::RejectAlwaysBashCommand(_)
         | PromptOutcome::RejectAlwaysMcpTool(_)
         | PromptOutcome::RejectAlwaysDomain(_)

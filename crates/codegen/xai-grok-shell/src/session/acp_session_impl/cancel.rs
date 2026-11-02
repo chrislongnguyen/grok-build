@@ -133,6 +133,7 @@ impl SessionActor {
         &self,
         replay_buffer: &mut ReplayBuffer,
     ) -> CancelOutcome {
+        self.permissions.revoke_pending_reviews();
         if let Some(notification) = replay_buffer.flush() {
             self.emit_buffered(notification).await;
         }
@@ -216,6 +217,7 @@ impl SessionActor {
         total_tokens: u64,
         turn_stopped: bool,
     ) -> CancelOutcome {
+        self.permissions.revoke_pending_reviews();
         if let Some(mut snapshot) = self.chat_state_handle.snapshot().await {
             let target_prompt_index =
                 target_prompt_index.unwrap_or_else(|| snapshot.prompt_index.saturating_sub(1));
@@ -252,6 +254,7 @@ impl SessionActor {
         &self,
         options: crate::session::CancelOptions,
     ) -> CancelOutcome {
+        self.permissions.revoke_pending_reviews();
         let kind = options
             .trigger
             .as_ref()

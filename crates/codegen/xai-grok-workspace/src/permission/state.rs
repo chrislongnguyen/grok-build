@@ -222,13 +222,17 @@ fn state_file_path(dir: &std::path::Path, client_identifier: Option<&str>) -> st
     }
 }
 
+pub(crate) fn parse_state(contents: &str) -> Result<PermissionState, toml::de::Error> {
+    toml::from_str(contents)
+}
+
 async fn try_load_state_with_writer<F>(path: &std::path::Path, writer: F) -> Option<PermissionState>
 where
     F: FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
 {
     match tokio::fs::read_to_string(path).await {
         Ok(s) => {
-            let mut state: PermissionState = toml::from_str(&s).unwrap_or_default();
+            let mut state: PermissionState = parse_state(&s).unwrap_or_default();
             if state.validated_mcp_server_grants_version < VALIDATED_MCP_SERVER_GRANTS_VERSION {
                 state.allowed_mcp_servers.clear();
                 state.validated_mcp_server_grants_version = VALIDATED_MCP_SERVER_GRANTS_VERSION;
@@ -286,8 +290,7 @@ async fn try_load_daemon_owned_state(
             MAX_DAEMON_STATE_FILE_BYTES,
             FileOwner::Daemon,
         )?;
-        toml::from_str::<PermissionState>(&text)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        parse_state(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })
     .await
     .map_err(std::io::Error::other);
@@ -406,6 +409,17 @@ impl CachedStateStore {
         store.last_sig = store.current_sig().await;
         let state = store.read().await;
         (store, state)
+    }
+
+    pub(crate) async fn read_for_review(
+        &self,
+    ) -> Option<(PermissionState, super::review::StoreSnapshot)> {
+        let snapshot = super::review::StoreSnapshot::capture(self.review_paths()).await?;
+        let state = self.read().await;
+        if !snapshot.unchanged().await {
+            return None;
+        }
+        Some((state, snapshot))
     }
 
     pub(crate) fn review_paths(&self) -> Vec<std::path::PathBuf> {

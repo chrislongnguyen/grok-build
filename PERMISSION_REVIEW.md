@@ -104,3 +104,21 @@ external changes restored between observations. Focused guard tests cover direct
 external deny creation without an actor reload and generation revocation despite
 restored store bytes; real two-call ACP and manual RejectAlways replays remain
 integration verification obligations.
+
+## Native state and the bound baseline
+
+V5 Auto requests force the existing native store loader to read state between
+matching content snapshots before evaluating permission. The loaded state is
+merged through the native state merge, retaining session restrictions. This
+bypasses the legacy metadata cache for review baseline establishment, including
+shared fallback changes and same-length changes with restored modification time.
+A changed baseline revokes previously prepared guards. Invalid UTF-8, malformed
+TOML, unreadable candidates or concurrent changes reject the request. Candidate
+syntax checks use the same native PermissionState parser; source selection and
+legacy precedence remain in the existing loader. No snapshot can qualify solely
+because its bytes match a later snapshot without this native state read.
+
+The actor regression starts with an absent desktop store and a shared fallback,
+warms the actor, then changes a shared denial without changing length or mtime.
+It asserts native rejection before any permission callback and fail-closed
+behavior for malformed state. Added tests have not been run in this writer lane.

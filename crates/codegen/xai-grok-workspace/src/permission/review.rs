@@ -147,6 +147,7 @@ impl StoreSnapshot {
                         if bytes.len() > 4 * 1024 * 1024 {
                             return None;
                         }
+                        super::state::parse_state(std::str::from_utf8(&bytes).ok()?).ok()?;
                         Some(format!("{:x}", Sha256::digest(&bytes)))
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

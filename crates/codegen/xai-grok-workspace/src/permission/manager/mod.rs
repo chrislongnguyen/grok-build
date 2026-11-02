@@ -550,6 +550,7 @@ pub fn spawn_permission_manager_with_pin(
             .map(String::as_str)
             .eq(DEFAULT_ALLOWED_DOMAINS.iter().copied());
         let mut applied_review_generation = 0_u64;
+        let mut evaluated_store_snapshot = None;
         while let Some(cmd) = rx.recv().await {
             if matches!(
                 &cmd,
@@ -622,12 +623,31 @@ pub fn spawn_permission_manager_with_pin(
                         },
                     mut respond_to,
                 } => {
-                    let request_generation = applied_review_generation;
                     let review_store_snapshot = if auto_mode {
-                        super::review::StoreSnapshot::capture(store.review_paths()).await
+                        let Some((fresh, snapshot)) = store.read_for_review().await else {
+                            review_generation_actor.fetch_add(1, Ordering::SeqCst);
+                            applied_review_generation += 1;
+                            evaluated_store_snapshot = None;
+                            let _ = respond_to.send(PermissionResolution {
+                                review_guard: None,
+                                decision: Decision::ReviewerRejected("Native permission store is unreadable, malformed or changed during loading; the action was not executed.".into()),
+                                event: None,
+                            });
+                            continue;
+                        };
+                        if evaluated_store_snapshot.as_ref() != Some(&snapshot) {
+                            review_generation_actor.fetch_add(1, Ordering::SeqCst);
+                            applied_review_generation += 1;
+                        }
+                        let allow_bash_execute = state.allow_bash_execute;
+                        state.merge_grants_from(fresh);
+                        state.allow_bash_execute = allow_bash_execute;
+                        evaluated_store_snapshot = Some(snapshot.clone());
+                        Some(snapshot)
                     } else {
                         None
                     };
+                    let request_generation = applied_review_generation;
                     let request_received = std::time::Instant::now();
                     let request_cwd = path_context
                         .as_ref()
@@ -736,10 +756,14 @@ pub fn spawn_permission_manager_with_pin(
                         continue;
                     }
 
-                    if matches!(
-                        &access,
-                        AccessKind::Bash(_) | AccessKind::MCPTool { .. } | AccessKind::WebFetch(_)
-                    ) && let Some(fresh) = store.reload_if_changed().await
+                    if !auto_mode
+                        && matches!(
+                            &access,
+                            AccessKind::Bash(_)
+                                | AccessKind::MCPTool { .. }
+                                | AccessKind::WebFetch(_)
+                        )
+                        && let Some(fresh) = store.reload_if_changed().await
                     {
                         review_generation_actor.fetch_add(1, Ordering::SeqCst);
                         applied_review_generation += 1;
@@ -7024,6 +7048,91 @@ mod tests {
                     "the block past the fresh total budget must prompt, got {d:?}"
                 );
                 assert_eq!(prompts.borrow().len(), 2);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn auto_actor_reads_changed_shared_fallback_before_review() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let mut seed = PermissionState::default();
+                seed.disallowed_bash_commands.insert("xxxx".into());
+                persist_state(&cwd, &seed, None).await;
+                let (store, _) = crate::permission::state::CachedStateStore::resolve_and_load(
+                    &cwd,
+                    Some("desktop"),
+                )
+                .await;
+                let shared = store
+                    .review_paths()
+                    .into_iter()
+                    .find(|p| p.file_name().unwrap() == "permission.toml" && p.exists())
+                    .unwrap();
+                assert!(!shared.with_file_name("permission_desktop.toml").exists());
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (gateway, receiver) = xai_acp_lib::acp_gateway::<acp::AgentSide, _>(client);
+                tokio::task::spawn_local(receiver.run());
+                let (mgr, _) = spawn_permission_manager_with_pin(
+                    acp::SessionId::new("fallback-review"),
+                    gateway,
+                    cwd.clone(),
+                    ClientType::Generic,
+                    None,
+                    vec![],
+                    vec![],
+                    false,
+                    Some("desktop".into()),
+                    true,
+                    None,
+                    None,
+                );
+                mgr.set_auto_mode(true);
+                assert!(matches!(
+                    decide(&mgr, AccessKind::Read(None), tool_call()).await,
+                    Decision::Allow
+                ));
+                let original = std::fs::read_to_string(&shared).unwrap();
+                let modified = std::fs::metadata(&shared).unwrap().modified().unwrap();
+                let denied = original.replace("xxxx", "bash");
+                assert_eq!(denied.len(), original.len());
+                assert_ne!(denied, original);
+                std::fs::write(&shared, denied).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&shared)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                let decision = decide(
+                    &mgr,
+                    AccessKind::Bash("bash /owned/reviewed.sh".into()),
+                    tool_call(),
+                )
+                .await;
+                assert!(
+                    matches!(decision, Decision::Reject(_) | Decision::PolicyDeny(_)),
+                    "{decision:?}"
+                );
+                assert!(
+                    prompts.borrow().is_empty(),
+                    "native deny must precede any reviewer callback"
+                );
+                std::fs::write(&shared, "this is not valid TOML [").unwrap();
+                assert!(matches!(
+                    decide(
+                        &mgr,
+                        AccessKind::Bash("bash /owned/reviewed.sh".into()),
+                        tool_call()
+                    )
+                    .await,
+                    Decision::ReviewerRejected(_)
+                ));
+                assert!(prompts.borrow().is_empty());
             })
             .await;
     }

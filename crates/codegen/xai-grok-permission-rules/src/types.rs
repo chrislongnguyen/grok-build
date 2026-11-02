@@ -30,6 +30,7 @@ pub enum Decision {
     Allow,
     Ask,
     FollowupMessage(String),
+    ReviewerRejected(String),
     Reject(String),
     PolicyDeny(String),
     Cancelled,

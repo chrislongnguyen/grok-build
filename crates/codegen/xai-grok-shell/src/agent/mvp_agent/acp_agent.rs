@@ -570,6 +570,7 @@ impl acp::Agent for MvpAgent {
                         .meta(
                             serde_json::json!({
                     "x.ai/fs_notify": true,
+                    "x.ai/permissionReview": {"version": 1, "build": "personal-native-review-v1", "inputBindings": "sha256"},
                     // Advertised so SDKs can warn when a registration depends on hook behavior this agent doesn't honor
                     "x.ai/hooks": {
                         "blockingEvents": crate::extensions::hooks::ADVERTISED_BLOCKING_EVENTS,

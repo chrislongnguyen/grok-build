@@ -125,6 +125,7 @@ pub(crate) fn permission_decision_source(decision: &Decision, is_yolo: bool) -> 
     match decision {
         Decision::PolicyDeny(_) => "config",
         Decision::Reject(_) => "user_reject",
+        Decision::ReviewerRejected(_) => "independent_reviewer",
         Decision::Cancelled => "user_abort",
         Decision::FollowupMessage(_) => "user_followup",
         Decision::Allow | Decision::Ask if is_yolo => "config",
@@ -186,7 +187,9 @@ pub(crate) fn resolved_decision_telemetry(
 pub(crate) fn permission_outcome(decision: &Decision) -> PermissionOutcome {
     match decision {
         Decision::Allow | Decision::Ask => PermissionOutcome::Allow,
-        Decision::Reject(_) | Decision::PolicyDeny(_) => PermissionOutcome::Deny,
+        Decision::ReviewerRejected(_) | Decision::Reject(_) | Decision::PolicyDeny(_) => {
+            PermissionOutcome::Deny
+        }
         Decision::Cancelled => PermissionOutcome::Cancelled,
         Decision::FollowupMessage(_) => PermissionOutcome::Followup,
     }

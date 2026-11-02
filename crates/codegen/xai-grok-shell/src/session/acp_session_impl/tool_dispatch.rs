@@ -49,6 +49,14 @@ pub(super) async fn dispatch_observed(
     origin: xai_grok_tools::types::tool_call_origin::ToolCallOrigin,
     slot: xai_grok_tools::types::source_summary::SourceSummarySlot,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+    if let Some(guard) = &prepared.review_guard {
+        if !guard.validate().await {
+            return Err(xai_tool_runtime::ToolError::new(
+                xai_tool_runtime::ToolErrorKind::Custom,
+                "Independent review expired before dispatch: bound inputs, permission context or cancellation changed. The action was not executed; choose an alternative or request a new review.".to_owned(),
+            ));
+        }
+    }
     let mut ctx = xai_tool_runtime::ToolCallContext::new(
         xai_tool_protocol::ToolCallId::new(prepared.tool_call_id.0.as_ref())
             .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7()),

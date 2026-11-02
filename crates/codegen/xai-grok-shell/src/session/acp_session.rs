@@ -630,6 +630,7 @@ mod managed_gateway_error_tests {
 /// Data carried from prepare_tool_call through dispatch_tool to finalize.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedToolCall {
+    review_guard: Option<xai_grok_workspace::permission::review::ExecutionGuard>,
     /// The model's tool call ID (for tool_result matching).
     call_id: String,
     /// ACP-internal tool call ID.
@@ -1867,6 +1868,7 @@ mod tool_meta_stamp_tests {
                 let (perm_tx, mut perm_rx) = mpsc::unbounded_channel();
                 fixture.actor.permissions = PermissionHandle::Actor {
                     cmd_tx: perm_tx,
+                    review_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     yolo_state: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     auto_state: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     side_query_wired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1891,6 +1893,7 @@ mod tool_meta_stamp_tests {
                             *captured_in_task.lock().await = Some(tool_call_update);
                             let _ = respond_to.send(
                                 xai_grok_workspace::permission::PermissionResolution {
+                                    review_guard: None,
                                     decision: Decision::Allow,
                                     event: None,
                                 },

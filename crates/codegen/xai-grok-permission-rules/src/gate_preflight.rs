@@ -99,6 +99,7 @@ impl GatePreflight {
                 decision @ (Decision::Ask
                 | Decision::Reject(_)
                 | Decision::PolicyDeny(_)
+                | Decision::ReviewerRejected(_)
                 | Decision::FollowupMessage(_)
                 | Decision::Cancelled),
             ) => decision,

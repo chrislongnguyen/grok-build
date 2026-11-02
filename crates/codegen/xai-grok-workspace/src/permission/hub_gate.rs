@@ -201,6 +201,7 @@ impl FolderGrants {
             Decision::Allow => Some(Ok(())),
             Decision::Reject(reason) => Some(Err(reason)),
             Decision::Ask
+            | Decision::ReviewerRejected(_)
             | Decision::FollowupMessage(_)
             | Decision::PolicyDeny(_)
             | Decision::Cancelled => None,

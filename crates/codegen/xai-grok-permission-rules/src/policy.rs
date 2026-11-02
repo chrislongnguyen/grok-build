@@ -793,7 +793,7 @@ fn decision_rank(decision: &Decision) -> u8 {
         Decision::Reject(_) | Decision::PolicyDeny(_) => 3,
         Decision::Ask => 2,
         Decision::Allow => 1,
-        Decision::FollowupMessage(_) | Decision::Cancelled => 0,
+        Decision::ReviewerRejected(_) | Decision::FollowupMessage(_) | Decision::Cancelled => 0,
     }
 }
 

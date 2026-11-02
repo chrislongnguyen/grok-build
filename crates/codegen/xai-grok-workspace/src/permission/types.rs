@@ -52,6 +52,7 @@ pub struct PermissionEvent {
 
 #[derive(Debug, Clone)]
 pub struct PermissionResolution {
+    pub review_guard: Option<super::review::ExecutionGuard>,
     pub decision: Decision,
     pub event: Option<PermissionEvent>,
 }
@@ -193,6 +194,7 @@ pub enum PermissionCommand {
     SetClassifier(Option<std::sync::Arc<dyn super::auto_mode::PermissionClassifier>>),
     SetClassifierTranscript(Vec<super::auto_mode::ClassifierTurn>),
     SetProjectInstructions(Option<String>),
+    InvalidateReviews,
     ResetState,
     Shutdown,
 }

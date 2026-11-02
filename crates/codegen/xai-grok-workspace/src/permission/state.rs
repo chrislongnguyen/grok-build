@@ -412,13 +412,15 @@ impl CachedStateStore {
     }
 
     pub(crate) async fn read_for_review(
-        &self,
+        &mut self,
     ) -> Option<(PermissionState, super::review::StoreSnapshot)> {
         let snapshot = super::review::StoreSnapshot::capture(self.review_paths()).await?;
+        let signature = self.current_sig().await;
         let state = self.read().await;
-        if !snapshot.unchanged().await {
+        if !snapshot.unchanged().await || signature != self.current_sig().await {
             return None;
         }
+        self.last_sig = signature;
         Some((state, snapshot))
     }
 

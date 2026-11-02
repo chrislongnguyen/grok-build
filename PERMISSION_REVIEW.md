@@ -122,3 +122,11 @@ The actor regression starts with an absent desktop store and a shared fallback,
 warms the actor, then changes a shared denial without changing length or mtime.
 It asserts native rejection before any permission callback and fail-closed
 behavior for malformed state. Added tests have not been run in this writer lane.
+
+V6 synchronizes the metadata cache only after the native read and both content
+and metadata stability checks succeed. Acceptance therefore compares against
+the evaluated baseline, rather than rejecting an unchanged baseline because of
+an older cached signature. An actor test supplies a valid bound allow after a
+benign primary-store update and checks both successful Allow with a valid guard
+and rejection when the callback writes a new deny. V6 tests and builds remain
+unrun in this writer lane.

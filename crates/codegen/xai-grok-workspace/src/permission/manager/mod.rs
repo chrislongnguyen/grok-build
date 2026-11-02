@@ -7052,6 +7052,118 @@ mod tests {
             .await;
     }
 
+    struct BoundReviewClient {
+        input: std::path::PathBuf,
+        store_to_change: Option<std::path::PathBuf>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for BoundReviewClient {
+        async fn request_permission(
+            &self,
+            args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            use sha2::{Digest, Sha256};
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let review = &args.meta.as_ref().unwrap()[super::super::review::META_KEY];
+            assert_eq!(review["eligibility"]["kind"], "classifier_hold");
+            if let Some(path) = &self.store_to_change {
+                let mut state = PermissionState::default();
+                state.disallowed_bash_commands.insert("bash".into());
+                std::fs::write(path, toml::to_string(&state).unwrap()).unwrap();
+            }
+            let answer = serde_json::json!({
+                "version": 1, "nonce": review["nonce"], "policyGeneration": review["policyGeneration"],
+                "actionDigest": review["actionDigest"], "decision": "allow_once",
+                "inputBindings": [{"path": self.input, "sha256": format!("{:x}", Sha256::digest(std::fs::read(&self.input).unwrap()))}]
+            });
+            let mut meta = acp::Meta::default();
+            meta.insert(super::super::review::META_KEY.into(), answer);
+            Ok(
+                acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Selected(
+                    acp::SelectedPermissionOutcome::new("allow-once"),
+                ))
+                .meta(Some(meta)),
+            )
+        }
+        async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_allow_uses_updated_primary_baseline_but_rejects_later_change() {
+        for change_during_review in [false, true] {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    persist_state(&cwd, &PermissionState::default(), None).await;
+                    let (store, _) =
+                        crate::permission::state::CachedStateStore::resolve_and_load(&cwd, None)
+                            .await;
+                    let primary = store
+                        .review_paths()
+                        .into_iter()
+                        .find(|p| p.exists())
+                        .unwrap();
+                    let input = tmp.path().join("reviewed.sh");
+                    std::fs::write(&input, "echo reviewed").unwrap();
+                    let input = std::fs::canonicalize(input).unwrap();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let client = BoundReviewClient {
+                        input: input.clone(),
+                        store_to_change: change_during_review.then_some(primary),
+                        calls: calls.clone(),
+                    };
+                    let (mgr, _) = manager_with_recording_client_remember(
+                        &cwd,
+                        None,
+                        client,
+                        ClientType::Extension,
+                        true,
+                    );
+                    mgr.set_auto_mode(true);
+                    let (classifier, _) = capturing_classifier(ClassifierVerdict::Block);
+                    mgr.set_classifier(Some(classifier));
+                    assert!(matches!(
+                        decide(&mgr, AccessKind::Read(None), tool_call()).await,
+                        Decision::Allow
+                    ));
+                    let mut unrelated = PermissionState::default();
+                    unrelated
+                        .allowed_bash_commands
+                        .insert("unrelated-command-with-long-arguments".into());
+                    persist_state(&cwd, &unrelated, None).await;
+                    let result = mgr
+                        .request(PermissionRequest::new(
+                            AccessKind::Bash(format!("bash {}", input.display())),
+                            tool_call(),
+                        ))
+                        .await;
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    if change_during_review {
+                        assert!(
+                            matches!(result.decision, Decision::ReviewerRejected(_)),
+                            "{:?}",
+                            result.decision
+                        );
+                        assert!(result.review_guard.is_none());
+                    } else {
+                        assert!(
+                            matches!(result.decision, Decision::Allow),
+                            "{:?}",
+                            result.decision
+                        );
+                        assert!(result.review_guard.unwrap().validate().await);
+                    }
+                })
+                .await;
+        }
+    }
+
     #[tokio::test]
     async fn auto_actor_reads_changed_shared_fallback_before_review() {
         let local = tokio::task::LocalSet::new();
